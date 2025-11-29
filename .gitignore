@@ -42,3 +42,4 @@ logs/
 __pycache__/
 infrastructure/master_files/js
 demos
+.venv310/
