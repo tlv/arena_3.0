@@ -49,6 +49,279 @@ FILENAME = "attn_only_2L_half.pth"
 
 MAIN = __name__ == "__main__"
 
+def current_attn_detector(cache: ActivationCache) -> list[str]:
+    """
+    Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be current-token heads
+    """
+    def _is_current_attn(scores):
+        return scores.trace() >= 0.5 * scores.sum()
+
+    result = []
+
+    for layer in [0, 1]:
+        pattern = cache["pattern", layer]
+        n_tokens = pattern.size(1)
+        mask = t.triu(t.tril(t.ones((n_tokens, n_tokens)))).to(device)
+        pattern_diags = pattern * mask
+        traces = t.sum(pattern_diags, dim=(1, 2))
+        scores_sum = t.sum(pattern, dim=(1, 2))
+        print(traces / scores_sum)
+        result += [
+            f"{layer}.{head}"
+            for head in range(traces.size(0))
+            if traces[head] >= scores_sum[head] * 0.2
+        ]
+
+    return result
+
+def prev_attn_detector(cache: ActivationCache) -> list[str]:
+    """
+    Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be prev-token heads
+    """
+    result = []
+
+    for layer in [0, 1]:
+        pattern = cache["pattern", layer]
+        n_tokens = pattern.size(1)
+        mask = t.triu(
+            t.tril(
+                t.ones((n_tokens, n_tokens)),
+                diagonal=1,
+            ),
+            diagonal=-1,
+        ).to(device)
+        pattern_diags = pattern * mask
+        offset_traces = t.sum(pattern_diags, dim=(1, 2))
+        scores_sum = t.sum(pattern, dim=(1, 2))
+        print(offset_traces / scores_sum)
+        result += [
+            f"{layer}.{head}"
+            for head in range(offset_traces.size(0))
+            if offset_traces[head] >= scores_sum[head] * 0.5
+        ]
+
+    return result
+
+
+def first_attn_detector(cache: ActivationCache) -> list[str]:
+    """
+    Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be first-token heads
+    """
+    result = []
+
+    for layer in [0, 1]:
+        pattern = cache["pattern", layer]
+        first_scores = t.sum(pattern[:, :, 0], dim=1)
+        scores_sum = t.sum(pattern, dim=(1, 2))
+        print(first_scores / scores_sum)
+        result += [
+            f"{layer}.{head}"
+            for head in range(first_scores.size(0))
+            if first_scores[head] >= scores_sum[head] * 0.5
+        ]
+
+    return result
+
+
+def generate_repeated_tokens(
+    model: HookedTransformer, seq_len: int, batch_size: int = 1
+) -> Int[Tensor, "batch_size full_seq_len"]:
+    """
+    Generates a sequence of repeated random tokens
+
+    Outputs are:
+        rep_tokens: [batch_size, 1+2*seq_len]
+    """
+    t.manual_seed(0)  # for reproducibility
+    prefix = (t.ones(batch_size, 1) * model.tokenizer.bos_token_id).long()
+    seq = t.randint(model.cfg.d_vocab, (batch_size, seq_len))
+    return t.cat((prefix, seq, seq), dim=1).to(device)
+
+
+def run_and_cache_model_repeated_tokens(
+    model: HookedTransformer, seq_len: int, batch_size: int = 1
+) -> tuple[Tensor, Tensor, ActivationCache]:
+    """
+    Generates a sequence of repeated random tokens, and runs the model on it, returning (tokens,
+    logits, cache). This function should use the `generate_repeated_tokens` function above.
+
+    Outputs are:
+        rep_tokens: [batch_size, 1+2*seq_len]
+        rep_logits: [batch_size, 1+2*seq_len, d_vocab]
+        rep_cache: The cache of the model run on rep_tokens
+    """
+    tokens = generate_repeated_tokens(model, seq_len, batch_size)
+    logits, cache = model.run_with_cache(tokens)
+    return tokens, logits, cache
+
+
+def get_log_probs(
+    logits: Float[Tensor, "batch posn d_vocab"], tokens: Int[Tensor, "batch posn"]
+) -> Float[Tensor, "batch posn-1"]:
+    logprobs = logits.log_softmax(dim=-1)
+    # We want to get logprobs[b, s, tokens[b, s+1]], in eindex syntax this looks like:
+    correct_logprobs = eindex(logprobs, tokens, "b s [b s+1]")
+    return correct_logprobs
+
+
+def induction_attn_detector(cache: ActivationCache) -> list[str]:
+    """
+    Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be induction heads
+
+    Remember - the tokens used to generate rep_cache are (bos_token, *rand_tokens, *rand_tokens)
+    """
+    pattern = rep_cache["pattern", 1]
+    seq_len = (pattern.size(1) - 1) // 2
+    result = []
+    for head in range(pattern.size(0)):
+        score = t.diagonal(pattern[head], offset=-seq_len + 1).mean()
+        if score > 0.5:
+            result.append(f"1.{head}")
+    return result
+
+
+def induction_score_hook(
+    pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
+):
+    """
+    Calculates the induction score, and stores it in the [layer, head] position of the
+    `induction_score_store` tensor.
+    """
+    seq_len = (pattern.size(2) - 1) // 2
+    layer_induction_scores = einops.reduce(
+        pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
+        "b h t -> h",
+        "mean",
+    )
+    induction_score_store[hook.layer(), :] = layer_induction_scores
+
+
+def visualize_pattern_hook(
+    pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
+):
+    seq_len = (pattern.size(2) - 1) // 2
+    layer_induction_scores = einops.reduce(
+        pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
+        "b h t -> h",
+        "mean",
+    )
+    if layer_induction_scores.max() >= 0.5:
+        print("Layer: ", hook.layer())
+        display(
+            cv.attention.attention_patterns(
+                tokens=gpt2_small.to_str_tokens(rep_tokens[0]), attention=pattern.mean(0)
+            )
+        )
+
+
+def find_induction_heads_hook(
+    pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
+):
+    seq_len = (pattern.size(2) - 1) // 2
+    layer_induction_scores = einops.reduce(
+        pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
+        "b h t -> h",
+        "mean",
+    )
+    gpt2_small_induction_scores_store[hook.layer(), :] = layer_induction_scores
+    if layer_induction_scores.max() >= 0.5:
+        heads = []
+        for i in range(len(layer_induction_scores)):
+            if layer_induction_scores[i] >= 0.3:
+                heads.append(i)
+        print(f"Found induction heads in layer {hook.layer()}: {', '.join(str(head) for head in heads)}")
+
+
+def logit_attribution(
+    embed: Float[Tensor, "seq d_model"],
+    l1_results: Float[Tensor, "seq nheads d_model"],
+    l2_results: Float[Tensor, "seq nheads d_model"],
+    W_U: Float[Tensor, "d_model d_vocab"],
+    tokens: Int[Tensor, "seq"],
+) -> Float[Tensor, "seq-1 n_components"]:
+    """
+    Inputs:
+        embed: the embeddings of the tokens (i.e. token + position embeddings)
+        l1_results: the outputs of the attention heads at layer 1 (with head as one of the dims)
+        l2_results: the outputs of the attention heads at layer 2 (with head as one of the dims)
+        W_U: the unembedding matrix
+        tokens: the token ids of the sequence
+
+    Returns:
+        Tensor of shape (seq_len-1, n_components)
+        represents the concatenation (along dim=-1) of logit attributions from:
+            the direct path (seq-1,1)
+            layer 0 logits (seq-1, n_heads)
+            layer 1 logits (seq-1, n_heads)
+        so n_components = 1 + 2*n_heads
+    """
+    W_U_correct_tokens = W_U[:, tokens[1:]]  # d_model seq
+
+    embed_attr = einops.rearrange(
+        einops.einsum(embed[:-1, :], W_U_correct_tokens, 't d, d t -> t'),
+        't -> t ()',
+    )
+    l1_attr = einops.einsum(l1_results[:-1, :], W_U_correct_tokens, 't nh d, d t -> t nh')
+    l2_attr = einops.einsum(l2_results[:-1, :], W_U_correct_tokens, 't nh d, d t -> t nh')
+
+    result = t.cat(
+        [embed_attr, l1_attr, l2_attr],
+        dim=1,
+    )
+    return result
+
+
+def head_zero_ablation_hook(
+    z: Float[Tensor, "batch seq n_heads d_head"],
+    hook: HookPoint,
+    head_index_to_ablate: int,
+) -> None:
+    z[:, :, head_index_to_ablate, :] = t.zeros([z.shape[0], z.shape[1], z.shape[3]])
+    return z
+
+def get_ablation_scores(
+    model: HookedTransformer,
+    tokens: Int[Tensor, "batch seq"],
+    ablation_function: Callable = head_zero_ablation_hook,
+) -> Float[Tensor, "n_layers n_heads"]:
+    """
+    Returns a tensor of shape (n_layers, n_heads) containing the increase in cross entropy loss
+    from ablating the output of each head.
+    """
+    # Initialize an object to store the ablation scores
+    ablation_scores = t.zeros((model.cfg.n_layers, model.cfg.n_heads), device=model.cfg.device)
+
+    # Calculating loss without any ablation, to act as a baseline
+    model.reset_hooks()
+    seq_len = (tokens.shape[1] - 1) // 2
+    logits = model(tokens, return_type="logits")
+    loss_no_ablation = -get_log_probs(logits, tokens)[:, -(seq_len - 1) :].mean()
+
+    for layer in tqdm(range(model.cfg.n_layers)):
+        for head in range(model.cfg.n_heads):
+            logits = model.run_with_hooks(
+                tokens,
+                return_type="logits",                    
+                fwd_hooks=[(
+                    utils.get_act_name("z", layer), 
+                    functools.partial(ablation_function, head_index_to_ablate=head),
+                )],
+            )
+            ablated_loss = -get_log_probs(logits, tokens)[:, -(seq_len - 1):].mean()
+            ablation_scores[layer][head] = ablated_loss - loss_no_ablation
+
+    return ablation_scores
+
+
+def head_mean_ablation_hook(
+    z: Float[Tensor, "batch seq n_heads d_head"],
+    hook: HookPoint,
+    head_index_to_ablate: int,
+) -> None:
+    mean_score = z[:, :, head_index_to_ablate, :].mean(dim=(0, 1))
+    z[:, :, head_index_to_ablate, :] = mean_score
+    return z
+
 
 if MAIN:
     # ---------------------------------------------------------------------------
@@ -177,124 +450,12 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
     print(attention_pattern_0.size())
 
     # %%
-    def current_attn_detector(cache: ActivationCache) -> list[str]:
-        """
-        Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be current-token heads
-        """
-        def _is_current_attn(scores):
-            return scores.trace() >= 0.5 * scores.sum()
-
-        result = []
-
-        for layer in [0, 1]:
-            pattern = cache["pattern", layer]
-            n_tokens = pattern.size(1)
-            mask = t.triu(t.tril(t.ones((n_tokens, n_tokens)))).to(device)
-            pattern_diags = pattern * mask
-            traces = t.sum(pattern_diags, dim=(1, 2))
-            scores_sum = t.sum(pattern, dim=(1, 2))
-            print(traces / scores_sum)
-            result += [
-                f"{layer}.{head}"
-                for head in range(traces.size(0))
-                if traces[head] >= scores_sum[head] * 0.2
-            ]
-
-        return result
-
-    def prev_attn_detector(cache: ActivationCache) -> list[str]:
-        """
-        Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be prev-token heads
-        """
-        result = []
-
-        for layer in [0, 1]:
-            pattern = cache["pattern", layer]
-            n_tokens = pattern.size(1)
-            mask = t.triu(
-                t.tril(
-                    t.ones((n_tokens, n_tokens)),
-                    diagonal=1,
-                ),
-                diagonal=-1,
-            ).to(device)
-            pattern_diags = pattern * mask
-            offset_traces = t.sum(pattern_diags, dim=(1, 2))
-            scores_sum = t.sum(pattern, dim=(1, 2))
-            print(offset_traces / scores_sum)
-            result += [
-                f"{layer}.{head}"
-                for head in range(offset_traces.size(0))
-                if offset_traces[head] >= scores_sum[head] * 0.5
-            ]
-
-        return result
-
-
-    def first_attn_detector(cache: ActivationCache) -> list[str]:
-        """
-        Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be first-token heads
-        """
-        result = []
-
-        for layer in [0, 1]:
-            pattern = cache["pattern", layer]
-            first_scores = t.sum(pattern[:, :, 0], dim=1)
-            scores_sum = t.sum(pattern, dim=(1, 2))
-            print(first_scores / scores_sum)
-            result += [
-                f"{layer}.{head}"
-                for head in range(first_scores.size(0))
-                if first_scores[head] >= scores_sum[head] * 0.5
-            ]
-
-        return result
 
     print("Heads attending to current token  = ", ", ".join(current_attn_detector(cache)))
     print("Heads attending to previous token = ", ", ".join(prev_attn_detector(cache)))
     print("Heads attending to first token    = ", ", ".join(first_attn_detector(cache)))
 
     # %%
-    def generate_repeated_tokens(
-        model: HookedTransformer, seq_len: int, batch_size: int = 1
-    ) -> Int[Tensor, "batch_size full_seq_len"]:
-        """
-        Generates a sequence of repeated random tokens
-
-        Outputs are:
-            rep_tokens: [batch_size, 1+2*seq_len]
-        """
-        t.manual_seed(0)  # for reproducibility
-        prefix = (t.ones(batch_size, 1) * model.tokenizer.bos_token_id).long()
-        seq = t.randint(model.cfg.d_vocab, (batch_size, seq_len))
-        return t.cat((prefix, seq, seq), dim=1).to(device)
-
-
-    def run_and_cache_model_repeated_tokens(
-        model: HookedTransformer, seq_len: int, batch_size: int = 1
-    ) -> tuple[Tensor, Tensor, ActivationCache]:
-        """
-        Generates a sequence of repeated random tokens, and runs the model on it, returning (tokens,
-        logits, cache). This function should use the `generate_repeated_tokens` function above.
-
-        Outputs are:
-            rep_tokens: [batch_size, 1+2*seq_len]
-            rep_logits: [batch_size, 1+2*seq_len, d_vocab]
-            rep_cache: The cache of the model run on rep_tokens
-        """
-        tokens = generate_repeated_tokens(model, seq_len, batch_size)
-        logits, cache = model.run_with_cache(tokens)
-        return tokens, logits, cache
-
-
-    def get_log_probs(
-        logits: Float[Tensor, "batch posn d_vocab"], tokens: Int[Tensor, "batch posn"]
-    ) -> Float[Tensor, "batch posn-1"]:
-        logprobs = logits.log_softmax(dim=-1)
-        # We want to get logprobs[b, s, tokens[b, s+1]], in eindex syntax this looks like:
-        correct_logprobs = eindex(logprobs, tokens, "b s [b s+1]")
-        return correct_logprobs
-
 
     seq_len = 50
     batch_size = 1
@@ -333,22 +494,11 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
 
     # %%
 
-    def induction_attn_detector(cache: ActivationCache) -> list[str]:
-        """
-        Returns a list e.g. ["0.2", "1.4", "1.9"] of "layer.head" which you judge to be induction heads
-
-        Remember - the tokens used to generate rep_cache are (bos_token, *rand_tokens, *rand_tokens)
-        """
-        pattern = rep_cache["pattern", 1]
-        seq_len = (pattern.size(1) - 1) // 2
-        result = []
-        for head in range(pattern.size(0)):
-            score = t.diagonal(pattern[head], offset=-seq_len + 1).mean()
-            if score > 0.5:
-                result.append(f"1.{head}")
-        return result
-
     print("Induction heads = ", ", ".join(induction_attn_detector(rep_cache)))
+
+    # ---------------------------------------------------------------------------
+    # PART 3
+    # ---------------------------------------------------------------------------
 
     # %%
 
@@ -363,22 +513,6 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
         (model.cfg.n_layers, model.cfg.n_heads), device=model.cfg.device
     )
     print(induction_score_store.shape)
-
-
-    def induction_score_hook(
-        pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
-    ):
-        """
-        Calculates the induction score, and stores it in the [layer, head] position of the
-        `induction_score_store` tensor.
-        """
-        seq_len = (pattern.size(2) - 1) // 2
-        layer_induction_scores = einops.reduce(
-            pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
-            "b h t -> h",
-            "mean",
-        )
-        induction_score_store[hook.layer(), :] = layer_induction_scores
 
 
     # We make a boolean filter on activation names, that's true only on attention pattern names
@@ -403,24 +537,6 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
 
     # %%
 
-    def visualize_pattern_hook(
-        pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
-    ):
-        seq_len = (pattern.size(2) - 1) // 2
-        layer_induction_scores = einops.reduce(
-            pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
-            "b h t -> h",
-            "mean",
-        )
-        if layer_induction_scores.max() >= 0.5:
-            print("Layer: ", hook.layer())
-            display(
-                cv.attention.attention_patterns(
-                    tokens=gpt2_small.to_str_tokens(rep_tokens[0]), attention=pattern.mean(0)
-                )
-            )
-
-
     gpt2_small.run_with_hooks(
         rep_tokens_10,
         return_type=None,  # For efficiency, we don't need to calculate the logits
@@ -428,26 +544,10 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
     )
 
     # %%
+
     gpt2_small_induction_scores_store =  t.zeros(
         (gpt2_small.cfg.n_layers, gpt2_small.cfg.n_heads), device=gpt2_small.cfg.device
     )
-
-    def find_induction_heads_hook(
-        pattern: Float[Tensor, "batch head_index source_pos dest_pos"], hook: HookPoint
-    ):
-        seq_len = (pattern.size(2) - 1) // 2
-        layer_induction_scores = einops.reduce(
-            pattern.diagonal(offset=-(seq_len - 1), dim1=2, dim2=3),
-            "b h t -> h",
-            "mean",
-        )
-        gpt2_small_induction_scores_store[hook.layer(), :] = layer_induction_scores
-        if layer_induction_scores.max() >= 0.5:
-            heads = []
-            for i in range(len(layer_induction_scores)):
-                if layer_induction_scores[i] >= 0.3:
-                    heads.append(i)
-            print(f"Found induction heads in layer {hook.layer()}: {', '.join(str(head) for head in heads)}")
 
     gpt2_small.run_with_hooks(
         rep_tokens_10,
@@ -465,44 +565,6 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
     )
 
     # %%
-    def logit_attribution(
-        embed: Float[Tensor, "seq d_model"],
-        l1_results: Float[Tensor, "seq nheads d_model"],
-        l2_results: Float[Tensor, "seq nheads d_model"],
-        W_U: Float[Tensor, "d_model d_vocab"],
-        tokens: Int[Tensor, "seq"],
-    ) -> Float[Tensor, "seq-1 n_components"]:
-        """
-        Inputs:
-            embed: the embeddings of the tokens (i.e. token + position embeddings)
-            l1_results: the outputs of the attention heads at layer 1 (with head as one of the dims)
-            l2_results: the outputs of the attention heads at layer 2 (with head as one of the dims)
-            W_U: the unembedding matrix
-            tokens: the token ids of the sequence
-
-        Returns:
-            Tensor of shape (seq_len-1, n_components)
-            represents the concatenation (along dim=-1) of logit attributions from:
-                the direct path (seq-1,1)
-                layer 0 logits (seq-1, n_heads)
-                layer 1 logits (seq-1, n_heads)
-            so n_components = 1 + 2*n_heads
-        """
-        W_U_correct_tokens = W_U[:, tokens[1:]]  # d_model seq
-
-        embed_attr = einops.rearrange(
-            einops.einsum(embed[:-1, :], W_U_correct_tokens, 't d, d t -> t'),
-            't -> t ()',
-        )
-        l1_attr = einops.einsum(l1_results[:-1, :], W_U_correct_tokens, 't nh d, d t -> t nh')
-        l2_attr = einops.einsum(l2_results[:-1, :], W_U_correct_tokens, 't nh d, d t -> t nh')
-
-        result = t.cat(
-            [embed_attr, l1_attr, l2_attr],
-            dim=1,
-        )
-        return result
-
 
     text = "We think that powerful, significantly superhuman machine intelligence is more likely than not to be created this century. If current machine learning techniques were scaled up to this level, we think they would by default produce systems that are deceptive or manipulative, and that no solid plans are known for how to avoid this."
     logits, cache = model.run_with_cache(text, remove_batch_dim=True)
@@ -543,47 +605,6 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
 
     # %%
 
-    def head_zero_ablation_hook(
-        z: Float[Tensor, "batch seq n_heads d_head"],
-        hook: HookPoint,
-        head_index_to_ablate: int,
-    ) -> None:
-        z[:, :, head_index_to_ablate, :] = t.zeros([z.shape[0], z.shape[1], z.shape[3]])
-        return z
-
-    def get_ablation_scores(
-        model: HookedTransformer,
-        tokens: Int[Tensor, "batch seq"],
-        ablation_function: Callable = head_zero_ablation_hook,
-    ) -> Float[Tensor, "n_layers n_heads"]:
-        """
-        Returns a tensor of shape (n_layers, n_heads) containing the increase in cross entropy loss
-        from ablating the output of each head.
-        """
-        # Initialize an object to store the ablation scores
-        ablation_scores = t.zeros((model.cfg.n_layers, model.cfg.n_heads), device=model.cfg.device)
-
-        # Calculating loss without any ablation, to act as a baseline
-        model.reset_hooks()
-        seq_len = (tokens.shape[1] - 1) // 2
-        logits = model(tokens, return_type="logits")
-        loss_no_ablation = -get_log_probs(logits, tokens)[:, -(seq_len - 1) :].mean()
-
-        for layer in tqdm(range(model.cfg.n_layers)):
-            for head in range(model.cfg.n_heads):
-                logits = model.run_with_hooks(
-                    tokens,
-                    return_type="logits",                    
-                    fwd_hooks=[(
-                        utils.get_act_name("z", layer), 
-                        functools.partial(ablation_function, head_index_to_ablate=head),
-                    )],
-                )
-                ablated_loss = -get_log_probs(logits, tokens)[:, -(seq_len - 1):].mean()
-                ablation_scores[layer][head] = ablated_loss - loss_no_ablation
-
-        return ablation_scores
-
     ablation_scores = get_ablation_scores(model, rep_tokens)
     tests.test_get_ablation_scores(ablation_scores, model, rep_tokens)
 
@@ -597,15 +618,6 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
     )
     
     # %%
-    def head_mean_ablation_hook(
-        z: Float[Tensor, "batch seq n_heads d_head"],
-        hook: HookPoint,
-        head_index_to_ablate: int,
-    ) -> None:
-        mean_score = z[:, :, head_index_to_ablate, :].mean(dim=(0, 1))
-        z[:, :, head_index_to_ablate, :] = mean_score
-        return z
-
 
     rep_tokens_batch = run_and_cache_model_repeated_tokens(model, seq_len=50, batch_size=10)[0]
     mean_ablation_scores = get_ablation_scores(
