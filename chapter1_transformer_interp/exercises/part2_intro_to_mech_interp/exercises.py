@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from eindex import eindex
 from IPython.display import display
 from jaxtyping import Float, Int
+from regex import W
 from torch import Tensor
 from tqdm import tqdm
 from transformer_lens import (ActivationCache, FactoredMatrix,
@@ -48,6 +49,8 @@ REPO_ID = "callummcdougall/attn_only_2L_half"
 FILENAME = "attn_only_2L_half.pth"
 
 MAIN = __name__ == "__main__"
+
+# %%
 
 def current_attn_detector(cache: ActivationCache) -> list[str]:
     """
@@ -322,6 +325,130 @@ def head_mean_ablation_hook(
     z[:, :, head_index_to_ablate, :] = mean_score
     return z
 
+
+def top_1_acc(full_OV_circuit: FactoredMatrix, batch_size: int = 1000) -> float:
+    """
+    Return the fraction of the time that the maximum value is on the circuit diagonal.
+    """
+    batch_num = 0
+    tot = 0
+    acc = 0
+    while batch_num * (batch_size + 1) < full_OV_circuit.ldim:
+        start = batch_num * batch_size
+        batch = full_OV_circuit[start : min(start + batch_size, full_OV_circuit.ldim), :]
+        num_samples = batch.ldim
+        max_idxs = t.argmax(batch.AB, dim=1)
+        tot += num_samples
+        acc += (max_idxs == t.arange(start, start + num_samples).to(device)).sum()
+        batch_num += 1
+    return acc/tot
+
+
+def decompose_qk_input(cache: ActivationCache) -> Float[Tensor, "n_heads+2 posn d_model"]:
+    """
+    Retrieves all the input tensors to the first attention layer, and concatenates them along the
+    0th dim.
+
+    The [i, :, :]th element is y_i (from notation above). The sum of these tensors along the 0th
+    dim should be the input to the first attention layer.
+    """
+
+    e = cache["embed"]
+    pe = cache["pos_embed"]
+    att_heads = []
+    for head in range(12):
+        att_heads.append(
+            cache["result", 0][:, head, :]
+        )
+    all_tensors = [e, pe] + att_heads
+    return einops.rearrange(all_tensors, 'i t d -> i t d')
+
+
+def decompose_q(
+    decomposed_qk_input: Float[Tensor, "n_heads+2 posn d_model"],
+    ind_head_index: int,
+    model: HookedTransformer,
+) -> Float[Tensor, "n_heads+2 posn d_head"]:
+    """
+    Computes the tensor of query vectors for each decomposed QK input.
+
+    The [i, :, :]th element is y_i @ W_Q (so the sum along axis 0 is just the q-values).
+    """
+    return decomposed_qk_input @ model.W_Q[1][ind_head_index]
+
+
+def decompose_k(
+    decomposed_qk_input: Float[Tensor, "n_heads+2 posn d_model"],
+    ind_head_index: int,
+    model: HookedTransformer,
+) -> Float[Tensor, "n_heads+2 posn d_head"]:
+    """
+    Computes the tensor of key vectors for each decomposed QK input.
+
+    The [i, :, :]th element is y_i @ W_K(so the sum along axis 0 is just the k-values)
+    """
+    return decomposed_qk_input @ model.W_K[1][ind_head_index]
+
+
+def decompose_attn_scores(
+    decomposed_q: Float[Tensor, "q_comp q_pos d_head"],
+    decomposed_k: Float[Tensor, "k_comp k_pos d_head"],
+    model: HookedTransformer,
+) -> Float[Tensor, "q_comp k_comp q_pos k_pos"]:
+    """
+    Output is decomposed_scores with shape [query_component, key_component, query_pos, key_pos]
+
+    The [i, j, 0, 0]th element is y_i @ W_QK @ y_j^T (so the sum along both first axes are the
+    attention scores)
+    """
+    return einops.einsum(
+        decomposed_q, 
+        decomposed_k,
+        "hq tq d, hk tk d -> hq hk tq tk",
+    ) / (decomposed_q.size(-1) ** 0.5)
+
+
+def find_K_comp_full_circuit(
+    model: HookedTransformer, prev_token_head_index: int, ind_head_index: int
+) -> FactoredMatrix:
+    """
+    Returns a (vocab, vocab)-size FactoredMatrix, with the first dimension being the query side
+    (direct from token embeddings) and the second dimension being the key side (going via the
+    previous token head).
+    """
+    W_E = model.W_E  # dv dm
+    W_V = model.W_V[0][prev_token_head_index]  # dm dh
+    W_O = model.W_O[0][prev_token_head_index]  # dh dm
+    W_Q = model.W_Q[1][ind_head_index]  # dm dh
+    W_K = model.W_K[1][ind_head_index]  # dm dh
+
+    W_OVT = FactoredMatrix(W_O.transpose(0, 1), W_V.transpose(0, 1))
+    W_QK = FactoredMatrix(W_Q, W_K.transpose(0, 1))
+
+    return W_E @ W_QK @ (W_OVT) @ (W_E.transpose(0, 1))
+
+
+def get_comp_score(W_A: Float[Tensor, "in_A out_A"], W_B: Float[Tensor, "out_A out_B"]) -> float:
+    """
+    Return the composition score between W_A and W_B.
+    """
+    result = t.linalg.matrix_norm(W_A @ W_B) / (t.linalg.matrix_norm(W_A) * t.linalg.matrix_norm(W_B))
+    return result.item()
+
+
+def generate_single_random_comp_score() -> float:
+    """
+    Write a function which generates a single composition score for random matrices
+    """
+    W = t.empty((4, 768, 64))
+    nn.init.kaiming_uniform_(W, a=np.sqrt(5))
+    return get_comp_score(
+        W[0] @ W[1].transpose(0, 1),
+        W[2] @ W[3].transpose(0, 1),
+    )
+
+
+# %%
 
 if MAIN:
     # ---------------------------------------------------------------------------
@@ -633,6 +760,260 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
         height=350,
     )
 
+    # ---------------------------------------------------------------------------
+    # PART 4
+    # ---------------------------------------------------------------------------
 
+    # %%
+
+    A = t.randn(5, 2)
+    B = t.randn(2, 5)
+    AB = A @ B
+    AB_factor = FactoredMatrix(A, B)
+    print("Norms:")
+    print(AB.norm())
+    print(AB_factor.norm())
+
+    print(f"Right dim: {AB_factor.rdim}, Left dim: {AB_factor.ldim}, Hidden dim: {AB_factor.mdim}")
+
+    print("Eigenvalues:")
+    print(t.linalg.eig(AB).eigenvalues)
+    print(AB_factor.eigenvalues)
+
+    print("\nSingular Values:")
+    print(t.linalg.svd(AB).S)
+    print(AB_factor.S)
+
+    print("\nFull SVD:")
+    print(AB_factor.svd())
+
+    C = t.randn(5, 300)
+    ABC = AB @ C
+    ABC_factor = AB_factor @ C
+
+    print(f"Unfactored: shape={ABC.shape}, norm={ABC.norm()}")
+    print(f"Factored: shape={ABC_factor.shape}, norm={ABC_factor.norm()}")
+    print(f"\nRight dim: {ABC_factor.rdim}, Left dim: {ABC_factor.ldim}, Hidden dim: {ABC_factor.mdim}")
+
+    AB_unfactored = AB_factor.AB
+    t.testing.assert_close(AB_unfactored, AB)
+
+    # %%
+
+    head_index = 4
+    layer = 1
+
+    # W_E: d_vocab x d_model
+    # W_U: d_model x d_vocab
+    # W_V: layers x heads x d_model x d_head
+    # W_O: layers x heads x d_head x d_model
+
+    # full circuit is W_E W_OV W_U
+    # W_OV is W_V W_O
+
+    full_OV_circuit = FactoredMatrix(
+        model.W_E @ model.W_V[layer][head_index],
+        model.W_O[layer][head_index] @ model.W_U,
+    )
+
+    tests.test_full_OV_circuit(full_OV_circuit, model, layer, head_index)
+
+    # %%
+
+    indices = t.randint(0, model.cfg.d_vocab, (200,))
+    full_OV_circuit_sample = full_OV_circuit[indices, indices].AB
+
+    imshow(
+        full_OV_circuit_sample,
+        labels={"x": "Logits on output token", "y": "Input token"},
+        title="Full OV circuit for copying head",
+        width=700,
+        height=600,
+    )
+
+    print(f"Fraction of time that the best logit is on diagonal: {top_1_acc(full_OV_circuit):.4f}")
+
+    combined_OV_circuit = (
+        model.W_E @ FactoredMatrix(
+            einops.rearrange([model.W_V[1][4], model.W_V[1][10]], 'h dm dh -> dm (h dh)'),
+            einops.rearrange([model.W_O[1][4], model.W_O[1][10]], 'h dh dm -> (h dh) dm')
+        ) @ model.W_U
+    )
+
+    print(f"Fraction of time that the best logit is on diagonal: {top_1_acc(combined_OV_circuit):.4f}")
+
+    # %%
+
+    layer = 0
+    head_index = 7
+
+    # Compute full QK matrix (for positional embeddings)
+    W_pos = model.W_pos
+    W_QK = model.W_Q[layer, head_index] @ model.W_K[layer, head_index].T
+    pos_by_pos_scores = W_pos @ W_QK @ W_pos.T
+
+    # Mask, scale and softmax the scores
+    mask = t.tril(t.ones_like(pos_by_pos_scores)).bool()
+    pos_by_pos_pattern = t.where(mask, pos_by_pos_scores / model.cfg.d_head**0.5, -1.0e6).softmax(-1)
+
+    # Plot the results
+    print(f"Avg lower-diagonal value: {pos_by_pos_pattern.diag(-1).mean():.4f}")
+    imshow(
+        utils.to_numpy(pos_by_pos_pattern[:200, :200]),
+        labels={"x": "Key", "y": "Query"},
+        title="Attention patterns for prev-token QK circuit, first 100 indices",
+        width=700,
+        height=600,
+    )
+
+    # %%
+
+    # Recompute rep tokens/logits/cache, if we haven't already
+    seq_len = 50
+    batch_size = 1
+    (rep_tokens, rep_logits, rep_cache) = run_and_cache_model_repeated_tokens(
+        model, seq_len, batch_size
+    )
+    rep_cache.remove_batch_dim()
+
+    ind_head_index = 4
+
+    # First we get decomposed q and k input, and check they're what we expect
+    decomposed_qk_input = decompose_qk_input(rep_cache)
+    decomposed_q = decompose_q(decomposed_qk_input, ind_head_index, model)
+    decomposed_k = decompose_k(decomposed_qk_input, ind_head_index, model)
+    t.testing.assert_close(
+        decomposed_qk_input.sum(0),
+        rep_cache["resid_pre", 1] + rep_cache["pos_embed"],
+        rtol=0.01,
+        atol=1e-05,
+    )
+    t.testing.assert_close(
+        decomposed_q.sum(0), rep_cache["q", 1][:, ind_head_index], rtol=0.01, atol=0.001
+    )
+    t.testing.assert_close(
+        decomposed_k.sum(0), rep_cache["k", 1][:, ind_head_index], rtol=0.01, atol=0.01
+    )
+
+    # Second, we plot our results
+    component_labels = ["Embed", "PosEmbed"] + [f"0.{h}" for h in range(model.cfg.n_heads)]
+    for decomposed_input, name in [(decomposed_q, "query"), (decomposed_k, "key")]:
+        imshow(
+            utils.to_numpy(decomposed_input.pow(2).sum([-1])),
+            labels={"x": "Position", "y": "Component"},
+            title=f"Norms of components of {name}",
+            y=component_labels,
+            width=800,
+            height=400,
+        )
+
+    # %%
+
+    tests.test_decompose_attn_scores(decompose_attn_scores, decomposed_q, decomposed_k, model)
+
+    # %%
+
+    # First plot: attention score contribution from (query_component, key_component) = (Embed, L0H7), you can replace this
+    # with any other pair and see that the values are generally much smaller, i.e. this pair dominates the attention score
+    # calculation
+    decomposed_scores = decompose_attn_scores(decomposed_q, decomposed_k, model)
+
+    q_label = "Embed"
+    k_label = "0.7"
+    decomposed_scores_from_pair = decomposed_scores[
+        component_labels.index(q_label), component_labels.index(k_label)
+    ]
+
+    imshow(
+        utils.to_numpy(t.tril(decomposed_scores_from_pair)),
+        title=f"Attention score contributions from query = {q_label}, key = {k_label}<br>(by query & key sequence positions)",
+        width=700,
+    )
+
+
+    # Second plot: std dev over query and key positions, shown by component. This shows us that the other pairs of
+    # (query_component, key_component) are much less important, without us having to look at each one individually like we
+    # did in the first plot!
+    decomposed_stds = einops.reduce(
+        decomposed_scores, "query_decomp key_decomp query_pos key_pos -> query_decomp key_decomp", t.std
+    )
+    imshow(
+        utils.to_numpy(decomposed_stds),
+        labels={"x": "Key Component", "y": "Query Component"},
+        title="Std dev of attn score contributions across sequence positions<br>(by query & key comp)",
+        x=component_labels,
+        y=component_labels,
+        width=700,
+    )
+
+    # %%
+
+    prev_token_head_index = 7
+    ind_head_index = 4
+    K_comp_circuit = find_K_comp_full_circuit(model, prev_token_head_index, ind_head_index)
+
+    tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
+
+    print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
+
+    # %%
+
+    tests.test_get_comp_score(get_comp_score)
+
+    # %%
+
+    W_QK = model.W_Q @ model.W_K.transpose(-1, -2)
+    W_OV = model.W_V @ model.W_O
+
+    # Define tensors to hold the composition scores
+    composition_scores = {
+        "Q": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+        "K": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+        "V": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+    }
+
+    # YOUR CODE HERE - fill in values of the `composition_scores` dict, using `get_comp_score`
+    for head_0 in range(12):
+        for head_1 in range(12):
+            composition_scores["Q"][head_0][head_1] = get_comp_score(
+                W_OV[0][head_0],
+                W_QK[1][head_1],
+            )
+            composition_scores["K"][head_0][head_1] = get_comp_score(
+                W_OV[0][head_0],
+                W_QK[1][head_1].transpose(0, 1),
+            )
+            composition_scores["V"][head_0][head_1] = get_comp_score(
+                W_OV[0][head_0],
+                W_OV[1][head_1],
+            )
+
+
+    # Plot the composition scores
+    for comp_type in ["Q", "K", "V"]:
+        plot_comp_scores(model, composition_scores[comp_type], f"{comp_type} Composition Scores")
+
+    # %%
+
+    n_samples = 300
+    comp_scores_baseline = np.zeros(n_samples)
+    for i in tqdm(range(n_samples)):
+        comp_scores_baseline[i] = generate_single_random_comp_score()
+
+    print("\nMean:", comp_scores_baseline.mean())
+    print("Std:", comp_scores_baseline.std())
+
+    hist(
+        comp_scores_baseline,
+        nbins=50,
+        width=800,
+        labels={"x": "Composition score"},
+        title="Random composition scores",
+    )
+
+
+# %%
+# %%
+# %%
 # %%
 # %%
