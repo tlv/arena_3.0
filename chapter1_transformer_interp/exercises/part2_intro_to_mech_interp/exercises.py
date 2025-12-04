@@ -1011,9 +1011,9 @@ For this demo notebook we'll look at GPT-2 Small, an 80M parameter model. To try
         title="Random composition scores",
     )
 
+    # %%
 
-# %%
-# %%
-# %%
-# %%
-# %%
+    baseline = comp_scores_baseline.mean()
+    for comp_type, comp_scores in composition_scores.items():
+        plot_comp_scores(model, comp_scores, f"{comp_type} Composition Scores", baseline=baseline)
+
