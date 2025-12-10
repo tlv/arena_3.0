@@ -650,3 +650,168 @@ if MAIN:
     )
 
 # %%
+
+class GatedToySAE(ToySAE):
+    W_gate: Float[Tensor, "inst d_in d_sae"]
+    b_gate: Float[Tensor, "inst d_sae"]
+    r_mag: Float[Tensor, "inst d_sae"]
+    b_mag: Float[Tensor, "inst d_sae"]
+    _W_dec: Float[Tensor, "inst d_sae d_in"] | None
+    b_dec: Float[Tensor, "inst d_in"]
+
+    def __init__(self, cfg: ToySAEConfig, model: ToyModel):
+        super(ToySAE, self).__init__()
+
+        assert cfg.d_in == model.cfg.d_hidden, "Model's hidden dim doesn't match SAE input dim"
+        self.cfg = cfg
+        self.model = model.requires_grad_(False)
+        self.model.W.data[1:] = self.model.W.data[0]
+        self.model.b_final.data[1:] = self.model.b_final.data[0]
+
+        self.W_gate = nn.Parameter(
+            nn.init.kaiming_uniform_(t.empty(self.cfg.n_inst, self.cfg.d_in, self.cfg.d_sae))
+        )
+        if self.cfg.tied_weights:
+            self._W_dec = None
+        else:
+            self._W_dec = nn.Parameter(
+                nn.init.kaiming_uniform_(t.empty(self.cfg.n_inst, self.cfg.d_sae, self.cfg.d_in))
+            )
+        self.b_gate = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_sae))
+        self.r_mag = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_sae))
+        self.b_mag = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_sae))
+        self.b_dec = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_in))
+
+        self.to(device)
+
+    @property
+    def W_dec(self) -> Float[Tensor, "inst d_sae d_in"]:
+        return self._W_dec if self._W_dec is not None else self.W_gate.transpose(-1, -2)
+
+    @property
+    def W_mag(self) -> Float[Tensor, "inst d_in d_sae"]:
+        return self.W_gate * t.exp(self.r_mag.unsqueeze(1))
+
+    def forward(
+        self, h: Float[Tensor, "batch inst d_in"]
+    ) -> tuple[
+        dict[str, Float[Tensor, "batch inst"]],
+        Float[Tensor, ""],
+        Float[Tensor, "batch inst d_sae"],
+        Float[Tensor, "batch inst d_in"],
+    ]:
+        """
+        Same as previous forward function, but allows for gated case as well (in which case we have
+        different functional form, as well as a new term "L_aux" in the loss dict).
+        """
+        # YOUR CODE HERE - implement the Gated forward function. This will be similar
+        # to the standard forward function, but with the gating mechanism included
+        # (plus a new loss term "L_aux" in the loss dict).
+        h_center = h - self.b_dec
+
+        gate_pre = einops.einsum(
+            self.W_gate,
+            h_center,
+            "ninst din dsae , b ninst din -> b ninst dsae",
+        ) + self.b_gate
+        gate = (gate_pre > 0).float()
+
+        mag = t.relu(
+            einops.einsum(
+                self.W_mag,
+                h_center,
+                "ninst din dsae , b ninst din -> b ninst dsae",
+            ) + self.b_mag
+        )
+
+        z = gate * mag
+        o = einops.einsum(
+            self.W_dec,
+            z,
+            "ninst dsae din, b ninst dsae -> b ninst din",
+        ) + self.b_dec
+        recon_loss = t.sum((o - h) ** 2, dim=-1) / self.cfg.d_in
+        l1_penalty = t.sum(t.relu(gate_pre), dim=-1)
+
+        W_dec_frozen = self.W_dec.detach()
+        b_dec_frozen = self.b_dec.detach()
+
+        aux_o = einops.einsum(
+            W_dec_frozen,
+            t.relu(gate_pre),
+            "ninst dsae din, b ninst dsae -> b ninst din",
+        ) + b_dec_frozen
+        aux_loss = t.sum((aux_o - h) ** 2, dim=-1)  # it doesn't work if we divide by self.cfg.d_in here
+
+        loss_dict = {
+            "L_reconstruction": recon_loss,
+            "L_sparsity": l1_penalty,
+            "L_aux": aux_loss,
+        }
+        loss = recon_loss + aux_loss + self.cfg.sparsity_coeff * l1_penalty
+
+        assert sorted(loss_dict.keys()) == ["L_aux", "L_reconstruction", "L_sparsity"]
+        return loss_dict, loss, z, o
+
+    @t.no_grad()
+    def resample_simple(
+        self, frac_active_in_window: Float[Tensor, "window inst d_sae"], resample_scale: float
+    ) -> None:
+        # YOUR CODE HERE - implement the resample_simple function for the Gated SAE.
+        # This will be identical to the ToySAE implementation, except that it will
+        # apply to different weights & biases.
+        mask = frac_active_in_window.sum(dim=0) < 1e-8  # inst d_sae
+        n_dead = mask.sum()
+        resample = t.randn(n_dead, self.cfg.d_in).to(self.W_gate.device)
+        resample = resample / resample.norm(dim=-1).unsqueeze(-1)
+        self.W_dec[mask] = resample
+        einops.rearrange(self.W_gate, 'ninst din dsae -> ninst dsae din')[mask] = resample * resample_scale
+        self.b_gate[mask] = 0
+        self.b_mag[mask] = 0
+        self.r_mag[mask] = 0
+
+    @t.no_grad()
+    def resample_advanced(
+        self,
+        frac_active_in_window: Float[Tensor, "window inst d_sae"],
+        resample_scale: float,
+        batch_size: int,
+    ) -> None:
+        # YOUR CODE HERE - implement the resample_advanced function for the Gated SAE.
+        # This will be identical to the ToySAE implementation, except that it will
+        # apply to different weights & biases.
+        raise NotImplementedError()
+
+# %%
+
+if MAIN:
+    gated_sae = GatedToySAE(
+        cfg=ToySAEConfig(n_inst=n_inst, d_in=d_in, d_sae=d_sae, sparsity_coeff=1.0),
+        model=model,
+    )
+    gated_data_log = gated_sae.optimize(steps=20_000, resample_method="simple")
+
+    # Animate the best instances, ranked according to average loss near the end of training
+    n_inst_to_plot = 4
+    n_batches_for_eval = 10
+    avg_loss = t.concat([d["loss"] for d in gated_data_log[-n_batches_for_eval:]]).mean(0)
+    best_instances = avg_loss.topk(n_inst_to_plot, largest=False).indices.tolist()
+
+    utils.animate_features_in_2d(
+        gated_data_log,
+        rows=["W_gate", "_W_dec", "h", "h_r"],
+        instances=best_instances,
+        filename=str(section_dir / "animation-training-gated.html"),
+        color_resampled_latents=True,
+        title="SAE on toy model",
+    )
+
+    # %%
+
+    utils.frac_active_line_plot(
+        frac_active=t.stack([data["frac_active"] for data in gated_data_log]),
+        title="Probability of sae features being active during training",
+        avg_window=20,
+    )
+
+# %%
