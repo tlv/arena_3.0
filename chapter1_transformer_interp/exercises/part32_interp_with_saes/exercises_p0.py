@@ -741,7 +741,9 @@ class GatedToySAE(ToySAE):
             t.relu(gate_pre),
             "ninst dsae din, b ninst dsae -> b ninst din",
         ) + b_dec_frozen
-        aux_loss = t.sum((aux_o - h) ** 2, dim=-1)  # it doesn't work if we divide by self.cfg.d_in here
+        # it doesn't work if we divide by self.cfg.d_in here (presumably, this needs a higher
+        # weight for some reason for the model to train well)
+        aux_loss = t.sum((aux_o - h) ** 2, dim=-1)  
 
         loss_dict = {
             "L_reconstruction": recon_loss,
@@ -812,6 +814,238 @@ if MAIN:
         frac_active=t.stack([data["frac_active"] for data in gated_data_log]),
         title="Probability of sae features being active during training",
         avg_window=20,
+    )
+
+# %%
+
+def rectangle(x: Tensor, width: float = 1.0) -> Tensor:
+    """
+    Returns the rectangle function value, i.e. K(x) = 1[|x| < width/2], as a float.
+    """
+    return (x.abs() < width / 2).float()
+
+
+class Heaviside(t.autograd.Function):
+    """
+    Implementation of the Heaviside step function, using straight through estimators for the deriv.
+
+        forward:
+            H(z,θ,ε) = 1[z > θ]
+
+        backward:
+            dH/dz := None
+            dH/dθ := -1/ε * K(z/ε)
+
+            where K is the rectangle kernel function with width 1, centered at 0: K(u) = 1[|u| < 1/2]
+    """
+
+    @staticmethod
+    def forward(ctx: Any, z: Tensor, theta: Tensor, eps: float) -> Tensor:
+        ctx.save_for_backward(z, theta)
+        ctx.eps = eps  # save eps for backward pass
+        return (z > theta).float()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, Tensor, None]:
+        z, theta = ctx.saved_tensors
+        eps = ctx.eps
+        z_grad = t.zeros(z.shape).to(z.device)
+        theta_grad = -1 / eps * rectangle((z - theta) / eps)
+        # don't forget to multiply grad_output lol
+        return z_grad * grad_output, theta_grad * grad_output, None
+
+# %%
+if MAIN:
+    # Test our Heaviside function, and its pseudo-gradient
+    z = t.tensor([[1.0, 1.4, 1.6, 2.0]], requires_grad=True)
+    theta = t.tensor([1.5, 1.5, 1.5, 1.5], requires_grad=True)
+    eps = 0.5
+    output = Heaviside.apply(z, theta, eps)
+    output.backward(t.ones_like(output))  # equiv to backprop on each elem of z independently
+
+    # Test values
+    t.testing.assert_close(output, t.tensor([[0.0, 0.0, 1.0, 1.0]]))  # expect H(θ,z,ε) = 1[z > θ]
+    t.testing.assert_close(
+        theta.grad, t.tensor([0.0, -2.0, -2.0, 0.0])
+    )  # expect dH/dθ = -1/ε * K((z-θ)/ε)
+    t.testing.assert_close(z.grad, t.tensor([[0.0, 0.0, 0.0, 0.0]]))  # expect dH/dz = zero
+
+    # Test handling of batch dimension
+    theta.grad = None
+    output_stacked = Heaviside.apply(t.concat([z, z]), theta, eps)
+    output_stacked.backward(t.ones_like(output_stacked))
+    t.testing.assert_close(theta.grad, 2 * t.tensor([0.0, -2.0, -2.0, 0.0]))
+
+    print("All tests for `Heaviside` passed!")
+
+# %%
+
+class JumpReLU(t.autograd.Function):
+    """
+    Implementation of the JumpReLU function, using straight through estimators for the derivative.
+
+        forward:
+            J(z,θ,ε) = z * 1[z > θ]
+
+        backward:
+            dJ/dθ := -θ/ε * K((z - θ)/ε)
+            dJ/dz := 1[z > θ]
+
+            where K is the rectangle kernel function with width 1, centered at 0: K(u) = 1[|u| < 1/2]
+    """
+
+    @staticmethod
+    def forward(ctx: Any, z: Tensor, theta: Tensor, eps: float) -> Tensor:
+        ctx.save_for_backward(z, theta)
+        ctx.eps = eps  # save eps for backward pass
+        return ((z - theta) > 0) * z
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, Tensor, None]:
+        z, theta = ctx.saved_tensors
+        eps = ctx.eps
+        z_grad = (z - theta > 0).float()
+        theta_grad = -theta / eps * rectangle((z - theta) / eps)
+        return z_grad * grad_output, theta_grad * grad_output, None
+
+# %%
+
+if MAIN:
+    # Test our JumpReLU function, and its pseudo-gradient
+    z = t.tensor([[1.0, 1.4, 1.6, 2.0]], requires_grad=True)
+    theta = t.tensor([1.5, 1.5, 1.5, 1.5], requires_grad=True)
+    eps = 0.5
+    output = JumpReLU.apply(z, theta, eps)
+    output.backward(
+        t.ones_like(output)
+    )  # equiv to backprop on each of the 5 elements of z independently
+
+    # Test values
+    t.testing.assert_close(
+        output, t.tensor([[0.0, 0.0, 1.6, 2.0]])
+    )  # expect J(θ,z,ε) = z * 1[z > θ]
+    t.testing.assert_close(
+        theta.grad, t.tensor([0.0, -3.0, -3.0, 0.0])
+    )  # expect dJ/dθ = -θ/ε * K((z-θ)/ε)
+    t.testing.assert_close(z.grad, t.tensor([[0.0, 0.0, 1.0, 1.0]]))  # expect dJ/dz = 1[z > θ]
+
+    print("All tests for `JumpReLU` passed!")
+
+# %%
+
+class JumpReLUToySAE(ToySAE):
+    _THETA_INIT = 0.1
+
+    W_enc: Float[Tensor, "inst d_in d_sae"]
+    _W_dec: Float[Tensor, "inst d_sae d_in"] | None
+    b_enc: Float[Tensor, "inst d_sae"]
+    b_dec: Float[Tensor, "inst d_in"]
+    log_theta: Float[Tensor, "inst d_sae"]
+
+    def __init__(self, cfg: ToySAEConfig, model: ToyModel):
+        super(ToySAE, self).__init__()
+
+        assert cfg.d_in == model.cfg.d_hidden, "Model's hidden dim doesn't match SAE input dim"
+        self.cfg = cfg
+        self.model = model.requires_grad_(False)
+        self.model.W.data[1:] = self.model.W.data[0]
+        self.model.b_final.data[1:] = self.model.b_final.data[0]
+
+        self.W_enc = nn.Parameter(
+            nn.init.kaiming_uniform_(t.empty(self.cfg.n_inst, self.cfg.d_in, self.cfg.d_sae))
+        )
+        if self.cfg.tied_weights:
+            self._W_dec = None
+        else:
+            self._W_dec = nn.Parameter(
+                nn.init.kaiming_uniform_(t.empty(self.cfg.n_inst, self.cfg.d_sae, self.cfg.d_in))
+            )
+        self.b_enc = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_sae))
+        self.log_theta = nn.Parameter(t.full((self.cfg.n_inst, self.cfg.d_sae), np.log(self._THETA_INIT)))
+        self.b_dec = nn.Parameter(t.zeros(self.cfg.n_inst, self.cfg.d_in))
+
+        self.to(device)
+
+    @property
+    def W_dec(self) -> Float[Tensor, "inst d_sae d_in"]:
+        return self._W_dec if self._W_dec is not None else self.W_enc.transpose(-1, -2)
+
+    @property
+    def theta(self) -> Float[Tensor, "inst dsae"]:
+        return t.exp(self.log_theta)
+
+    def forward(
+        self, h: Float[Tensor, "batch inst d_in"]
+    ) -> tuple[
+        dict[str, Float[Tensor, "batch inst"]],
+        Float[Tensor, ""],
+        Float[Tensor, "batch inst d_sae"],
+        Float[Tensor, "batch inst d_in"],
+    ]:
+        h_center = h - self.b_dec
+
+        acts_pre = einops.einsum(
+            self.W_enc,
+            h_center,
+            "ninst din dsae , b ninst din -> b ninst dsae",
+        ) + self.b_enc
+        z = JumpReLU.apply(t.relu(acts_pre), self.theta, self.cfg.ste_epsilon)
+
+        o = einops.einsum(
+            self.W_dec,
+            z,
+            "ninst dsae din, b ninst dsae -> b ninst din",
+        ) + self.b_dec
+        recon_loss = t.mean((o - h) ** 2, dim=-1)
+
+        l0_penalty = Heaviside.apply(t.relu(acts_pre), self.theta, self.cfg.ste_epsilon).sum(dim=-1)
+
+        loss_dict = {
+            "L_reconstruction": recon_loss,
+            "L_sparsity": l0_penalty,
+        }
+        loss = recon_loss + self.cfg.sparsity_coeff * l0_penalty
+
+        return loss_dict, loss, z, o
+
+    @t.no_grad()
+    def resample_simple(
+        self, frac_active_in_window: Float[Tensor, "window inst d_sae"], resample_scale: float
+    ) -> None:
+        mask = frac_active_in_window.sum(dim=0) < 1e-8  # inst d_sae
+        n_dead = mask.sum()
+        resample = t.randn(n_dead, self.cfg.d_in).to(self.W_enc.device)
+        resample = resample / resample.norm(dim=-1).unsqueeze(-1)
+        self.W_dec[mask] = resample
+        einops.rearrange(self.W_enc, 'ninst din dsae -> ninst dsae din')[mask] = resample * resample_scale
+        self.b_enc[mask] = 0
+        self.log_theta[mask] = np.log(self._THETA_INIT)
+
+
+if MAIN:
+    jumprelu_sae = JumpReLUToySAE(
+        cfg=ToySAEConfig(
+            n_inst=n_inst, d_in=d_in, d_sae=d_sae, tied_weights=True, sparsity_coeff=0.1
+        ),
+        model=model,
+    )
+    jumprelu_data_log = jumprelu_sae.optimize(
+        steps=20_000, resample_method="simple"
+    )  # batch_size=4096?
+
+    # Animate the best instances, ranked according to average loss near the end of training
+    n_inst_to_plot = 4
+    n_batches_for_eval = 10
+    avg_loss = t.concat([d["loss"] for d in jumprelu_data_log[-n_batches_for_eval:]]).mean(0)
+    best_instances = avg_loss.topk(n_inst_to_plot, largest=False).indices.tolist()
+
+    utils.animate_features_in_2d(
+        jumprelu_data_log,
+        rows=["W_enc", "h", "h_r"],
+        instances=best_instances,
+        filename=str(section_dir / "animation-training-jumprelu.html"),
+        color_resampled_latents=True,
+        title="JumpReLU SAE on toy model",
     )
 
 # %%
