@@ -632,17 +632,21 @@ def fetch_max_activating_examples_attn(
     max_dest_idx = get_k_largest_indices(all_acts, k, buffer=0)
     dest_with_buffer = index_with_buffer(all_tokens, max_dest_idx.clone(), buffer=buffer)
 
-    def get_max_source_idx(dest_idx):
-        batch = dest_idx[0]
-        dest_pos = dest_idx[1]
-        vals = einops.rearrange(all_attn_v[batch], "ctx h dh -> h ctx dh")
-        pattern = all_attn_pattern[batch, :, dest_pos, :].unsqueeze(-1)  # h ctx 1
-        vals_weighted = vals * pattern
-        vals_flattened = einops.rearrange(vals_weighted, "h ctx dh -> (h dh) ctx")
-        dfa = sae.W_dec[latent_idx] @ vals_flattened
-        return t.argmax(dfa).item()
-
-    max_source_idx_ctx = [get_max_source_idx(dest_idx) for dest_idx in max_dest_idx]
+    vals = einops.rearrange(
+        all_attn_v[max_dest_idx[:, 0]],
+        "k ctx h dh -> k h ctx dh",
+    )
+    pattern = all_attn_pattern[max_dest_idx[:, 0], :, max_dest_idx[:, 1], :].unsqueeze(-1)  # k h ctx 1
+    print(vals.shape)
+    print(pattern.shape)
+    vals_weighted = vals * pattern
+    vals_flattened = einops.rearrange(vals_weighted, "k h ctx dh -> k (h dh) ctx")
+    dfa = einops.einsum(
+        vals_flattened,
+        sae.W_dec[latent_idx],
+        "k hdh ctx, hdh -> k ctx"
+    )
+    max_source_idx_ctx = dfa.argmax(dim=-1)
     max_source_idx = einops.rearrange(
         t.stack([max_dest_idx[:, 0], t.Tensor(max_source_idx_ctx).to(device)]),
         "idx k -> k idx",
