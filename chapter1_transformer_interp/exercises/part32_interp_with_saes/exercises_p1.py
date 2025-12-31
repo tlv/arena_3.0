@@ -58,6 +58,9 @@ import part31_superposition_and_saes.utils as utils
 from plotly_utils import imshow, line
 
 MAIN = __name__ == "__main__"
+RUN_INTRO_EXERCISES = False
+RUN_RESID_SAE_EXERCISES = False
+RUN_ATTN_SAE_EXERCISES = False
 
 # %%
 def format_value(value):
@@ -67,7 +70,7 @@ def format_value(value):
         else repr(value)
     )
 
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     print(get_pretrained_saes_directory())
 
     metadata_rows = [
@@ -135,12 +138,12 @@ def display_dashboard(
     print(url)
     display(IFrame(url, width=width, height=height))
 
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     latent_idx = random.randint(0, gpt2_sae.cfg.d_sae)
     display_dashboard(latent_idx=latent_idx)
 
 # %%
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     prompt = "Mitigating the risk of extinction from AI should be a global"
     answer = " priority"
 
@@ -173,14 +176,14 @@ if MAIN:
         prob = {top_prob_sae.item():.2%}
     """)
 # %%
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     _, cache = gpt2.run_with_cache_with_saes(prompt, saes=[gpt2_sae])
 
     for name, param in cache.items():
         if "hook_sae" in name:
             print(f"{name:<43}: {tuple(param.shape)}")
 # %%
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     # Get top activations on final token
     _, cache = gpt2.run_with_cache_with_saes(
         prompt,
@@ -202,7 +205,7 @@ if MAIN:
         print(f"Latent {ind} had activation {act:.2f}")
         display_dashboard(latent_idx=ind)
 # %%
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     logits_no_saes, cache_no_saes = gpt2.run_with_cache(prompt)
 
     gpt2_sae.use_error_term = False
@@ -265,6 +268,8 @@ def show_activation_histogram(
         sae_acts_post = cache[f"{sae.cfg.hook_name}.hook_sae_acts_post"][:, :, latent_idx]
         sae_acts_nonzero = sae_acts_post[sae_acts_post > 1e-8]
         nonzero_acts.append(sae_acts_nonzero.clone().cpu())
+        del cache
+        t.cuda.empty_cache()
     all_nonzero_acts = t.cat(nonzero_acts)
 
     frac_active = all_nonzero_acts.shape[0] / total_acts
@@ -279,7 +284,7 @@ def show_activation_histogram(
     ).update_layout(bargap=0.02, showlegend=False).show()
 
 
-if MAIN:
+if MAIN and RUN_INTRO_EXERCISES:
     show_activation_histogram(gpt2, gpt2_sae, gpt2_act_store, latent_idx=9)
 
 # %%
@@ -324,7 +329,7 @@ def get_k_largest_indices(
     return t.stack((rows, cols), dim=1)[:k]
 
 
-if MAIN:
+if MAIN and RUN_RESID_SAE_EXERCISES:
     x = t.arange(40, device=device).reshape((2, 20))
     x[0, 10] += 50  # 2nd highest value
     x[0, 16] += 100  # highest value
@@ -354,7 +359,7 @@ def index_with_buffer(
         )
     return x[rows, cols]
 
-if MAIN:
+if MAIN and RUN_RESID_SAE_EXERCISES:
     x_top_values_with_context = index_with_buffer(x, top_indices, buffer=3)
     assert x_top_values_with_context[0].tolist() == [
         13,
@@ -400,7 +405,7 @@ def display_top_seqs(data: list[tuple[float, list[str], int]]):
     rprint(table)
 
 
-if MAIN:
+if MAIN and RUN_RESID_SAE_EXERCISES:
     example_data = [
         (0.5, [" one", " two", " three"], 0),
         (1.5, [" one", " two", " three"], 1),
@@ -435,6 +440,8 @@ def fetch_max_activating_examples(
         sae_acts_post = cache[f"{sae.cfg.hook_name}.hook_sae_acts_post"][:, :, latent_idx]
         all_acts_list.append(sae_acts_post.clone())
         all_tokens_list.append(tokens)
+        del cache
+        t.cuda.empty_cache()
     all_acts = t.cat(all_acts_list)
     all_tokens = t.cat(all_tokens_list)
     max_idx = get_k_largest_indices(all_acts, k, buffer=0)
@@ -457,7 +464,7 @@ def fetch_max_activating_examples(
     return data
 
 
-if MAIN:
+if MAIN and RUN_RESID_SAE_EXERCISES:
     # Fetch & display the results
     buffer = 10
     data = fetch_max_activating_examples(
@@ -494,5 +501,199 @@ def show_top_logits(
 
 show_top_logits(gpt2, gpt2_sae, latent_idx=9)
 # tests.test_show_top_logits(show_top_logits, gpt2, gpt2_sae)
+
+# %%
+
+if MAIN and RUN_ATTN_SAE_EXERCISES:
+    attn_saes = {
+        layer: SAE.from_pretrained(
+            "gpt2-small-hook-z-kk",
+            f"blocks.{layer}.hook_z",
+            device=str(device),
+        )[0]
+        for layer in [9]  # range(gpt2.cfg.n_layers)  NB - just load one to save memory
+    }
+
+    layer = 9
+
+    display_dashboard(
+        sae_release="gpt2-small-hook-z-kk",
+        sae_id=f"blocks.{layer}.hook_z",
+        latent_idx=2,  # or you can try `random.randint(0, attn_saes[layer].cfg.d_sae)`
+    )
+# %%
+
+@dataclass
+class AttnSeqDFA:
+    act: float
+    str_toks_dest: list[str]
+    str_toks_src: list[str]
+    dest_pos: int
+    src_pos: int
+
+
+def display_top_seqs_attn(data: list[AttnSeqDFA]):
+    """
+    Same as previous function, but we now have 2 str_tok lists and 2 sequence positions to
+    highlight, the first being for top activations (destination token) and the second for top DFA
+    (src token). We've given you a dataclass to help keep track of this.
+    """
+    table = Table(
+        "Top Act",
+        "Src token DFA (for top dest token)",
+        "Dest token",
+        title="Max Activating Examples",
+        show_lines=True,
+    )
+    for seq in data:
+        formatted_seqs = [
+            repr(
+                "".join(
+                    [
+                        f"[b u {color}]{str_tok}[/]" if i == seq_pos else str_tok
+                        for i, str_tok in enumerate(str_toks)
+                    ]
+                )
+                .replace("�", "")
+                .replace("\n", "↵")
+            )
+            for str_toks, seq_pos, color in [
+                (seq.str_toks_src, seq.src_pos, "dark_orange"),
+                (seq.str_toks_dest, seq.dest_pos, "green"),
+            ]
+        ]
+        table.add_row(f"{seq.act:.3f}", *formatted_seqs)
+    rprint(table)
+
+if MAIN and RUN_ATTN_SAE_EXERCISES:
+    str_toks = [" one", " two", " three", " four"]
+    example_data = [
+    AttnSeqDFA(
+        act=0.5, str_toks_dest=str_toks[1:], str_toks_src=str_toks[:-1], dest_pos=0, src_pos=0
+    ),
+    AttnSeqDFA(
+        act=1.5, str_toks_dest=str_toks[1:], str_toks_src=str_toks[:-1], dest_pos=1, src_pos=1
+    ),
+    AttnSeqDFA(
+        act=2.5, str_toks_dest=str_toks[1:], str_toks_src=str_toks[:-1], dest_pos=2, src_pos=0
+    ),
+    ]
+    display_top_seqs_attn(example_data)
+
+def fetch_max_activating_examples_attn(
+    model: HookedSAETransformer,
+    sae: SAE,
+    act_store: ActivationsStore,
+    latent_idx: int,
+    total_batches: int = 250,
+    k: int = 10,
+    buffer: int = 10,
+) -> list[AttnSeqDFA]:
+    """
+    Returns the max activating examples across a number of batches from the activations store.
+    """
+    all_acts_list = []
+    all_tokens_list = []
+    all_attn_v_list = []
+    all_attn_pattern_list = []
+    sae_acts_name = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+    attn_v_name = f"blocks.{sae.cfg.hook_layer}.attn.hook_v"
+    attn_pattern_name = f"blocks.{sae.cfg.hook_layer}.attn.hook_pattern"
+
+    for i in tqdm(range(total_batches), "computing activations..."):
+        tokens = act_store.get_batch_tokens()
+        _, cache = model.run_with_cache_with_saes(
+            tokens,
+            saes=[sae],
+            stop_at_layer=sae.cfg.hook_layer + 1,
+            names_filter=[
+                sae_acts_name,
+                attn_v_name,
+                attn_pattern_name,
+            ],
+        )
+        sae_acts_post = cache[sae_acts_name][:, :, latent_idx]
+        all_acts_list.append(sae_acts_post.clone())
+        all_tokens_list.append(tokens.clone())
+        all_attn_v_list.append(cache[attn_v_name].clone())
+        all_attn_pattern_list.append(cache[attn_pattern_name].clone())
+        del cache
+        t.cuda.empty_cache()
+    all_acts = t.cat(all_acts_list)
+    all_tokens = t.cat(all_tokens_list)
+    all_attn_v = t.cat(all_attn_v_list)
+    all_attn_pattern = t.cat(all_attn_pattern_list)
+
+    print(all_acts.shape)
+    print(all_tokens.shape)
+    print(all_attn_v.shape)
+    print(all_attn_pattern.shape)
+
+    max_dest_idx = get_k_largest_indices(all_acts, k, buffer=0)
+    dest_with_buffer = index_with_buffer(all_tokens, max_dest_idx.clone(), buffer=buffer)
+
+    def get_max_source_idx(dest_idx):
+        batch = dest_idx[0]
+        dest_pos = dest_idx[1]
+        vals = einops.rearrange(all_attn_v[batch], "ctx h dh -> h ctx dh")
+        pattern = all_attn_pattern[batch, :, dest_pos, :].unsqueeze(-1)  # h ctx 1
+        vals_weighted = vals * pattern
+        vals_flattened = einops.rearrange(vals_weighted, "h ctx dh -> (h dh) ctx")
+        dfa = sae.W_dec[latent_idx] @ vals_flattened
+        return t.argmax(dfa).item()
+
+    max_source_idx_ctx = [get_max_source_idx(dest_idx) for dest_idx in max_dest_idx]
+    max_source_idx = einops.rearrange(
+        t.stack([max_dest_idx[:, 0], t.Tensor(max_source_idx_ctx).to(device)]),
+        "idx k -> k idx",
+    ).int()
+    source_with_buffer = index_with_buffer(all_tokens, max_source_idx, buffer=buffer)
+
+    data = []
+    for i in range(k):
+        dest_tokens = all_tokens[max_dest_idx[i][0]]
+        dest_seq = dest_with_buffer[i]
+        source_tokens = all_tokens[max_source_idx[i][0]]
+        source_seq = source_with_buffer[i]
+
+        act = all_acts[tuple(max_dest_idx[i])]
+
+        if max_dest_idx[i][1] < buffer:
+            dest_idx_in_seq = max_dest_idx[i][1]
+        elif max_dest_idx[i][1] > len(dest_tokens) - 1 - buffer:
+            dest_idx_in_seq = 2 * buffer + 1 - (len(dest_tokens) - max_dest_idx[i][1])
+        else:
+            dest_idx_in_seq = buffer
+
+        if max_source_idx[i][1] < buffer:
+            source_idx_in_seq = max_source_idx[i][1]
+        elif max_source_idx[i][1] > len(source_tokens) - 1 - buffer:
+            source_idx_in_seq = 2 * buffer + 1 - (len(source_tokens) - max_source_idx[i][1])
+        else:
+            source_idx_in_seq = buffer
+
+        if dest_idx_in_seq >= 0 and dest_idx_in_seq < len(dest_seq) and source_idx_in_seq >= 0 and source_idx_in_seq < len(source_seq):
+            data.append(AttnSeqDFA(
+                act=act,
+                str_toks_dest=model.to_str_tokens(dest_seq),
+                str_toks_src=model.to_str_tokens(source_seq),
+                dest_pos=dest_idx_in_seq,
+                src_pos=source_idx_in_seq,
+            ),)
+        else:
+            raise Exception()
+    return data
+
+
+if MAIN and RUN_ATTN_SAE_EXERCISES:
+    # Test your function: compare it to dashboard above
+    # (max DFA should come from sourcs tokens like " guns", " firearms")
+    gc.collect()
+    t.cuda.empty_cache()
+    layer = 9
+    sae = attn_saes[layer]
+    data = fetch_max_activating_examples_attn(gpt2, attn_saes[layer], gpt2_act_store, latent_idx=2)
+    display_top_seqs_attn(data)
+
 
 # %%
