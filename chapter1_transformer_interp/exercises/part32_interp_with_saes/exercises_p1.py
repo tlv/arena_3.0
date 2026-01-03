@@ -61,7 +61,7 @@ MAIN = __name__ == "__main__"
 RUN_INTRO_EXERCISES = False
 RUN_RESID_SAE_EXERCISES = False
 RUN_ATTN_SAE_EXERCISES = False
-RUN_FIND_LATENTS_EXERCISES = True
+RUN_FIND_LATENTS_EXERCISES = False
 
 # %%
 def format_value(value):
@@ -705,19 +705,18 @@ if MAIN and RUN_ATTN_SAE_EXERCISES:
 
 # %%
 
-if MAIN and RUN_FIND_LATENTS_EXERCISES:
-    names = [" John", " Mary"]
-    name_tokens = [gpt2.to_single_token(name) for name in names]
+names = [" John", " Mary"]
+name_tokens = [gpt2.to_single_token(name) for name in names]
 
-    prompt_template = "When{A} and{B} went to the shops,{S} gave the bag to"
-    prompts = [
-        prompt_template.format(A=names[i], B=names[1 - i], S=names[j])
-        for i, j in itertools.product(range(2), range(2))
-    ]
-    correct_answers = names[::-1] * 2
-    incorrect_answers = names * 2
-    correct_toks = gpt2.to_tokens(correct_answers, prepend_bos=False)[:, 0].tolist()
-    incorrect_toks = gpt2.to_tokens(incorrect_answers, prepend_bos=False)[:, 0].tolist()
+prompt_template = "When{A} and{B} went to the shops,{S} gave the bag to"
+prompts = [
+    prompt_template.format(A=names[i], B=names[1 - i], S=names[j])
+    for i, j in itertools.product(range(2), range(2))
+]
+correct_answers = names[::-1] * 2
+incorrect_answers = names * 2
+correct_toks = gpt2.to_tokens(correct_answers, prepend_bos=False)[:, 0].tolist()
+incorrect_toks = gpt2.to_tokens(incorrect_answers, prepend_bos=False)[:, 0].tolist()
 
 
 def logits_to_ave_logit_diff(
@@ -1067,7 +1066,3 @@ print(t.cuda.memory_allocated() / 1e9)
 # %%
 gc.collect()
 t.cuda.empty_cache()
-
-# %%
-# %%
-# %%
