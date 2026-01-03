@@ -61,6 +61,7 @@ MAIN = __name__ == "__main__"
 RUN_INTRO_EXERCISES = False
 RUN_RESID_SAE_EXERCISES = False
 RUN_ATTN_SAE_EXERCISES = False
+RUN_FIND_LATENTS_EXERCISES = True
 
 # %%
 def format_value(value):
@@ -499,19 +500,21 @@ def show_top_logits(
         table.add_row(bot_token, f"{bot_val:.4f}", top_token, f"{top_val:.4f}")
     rprint(table)
 
-show_top_logits(gpt2, gpt2_sae, latent_idx=9)
-# tests.test_show_top_logits(show_top_logits, gpt2, gpt2_sae)
+
+if RUN_RESID_SAE_EXERCISES:
+    show_top_logits(gpt2, gpt2_sae, latent_idx=9)
+    # tests.test_show_top_logits(show_top_logits, gpt2, gpt2_sae)
 
 # %%
 
-if MAIN and RUN_ATTN_SAE_EXERCISES:
+if MAIN and RUN_ATTN_SAE_EXERCISES or RUN_FIND_LATENTS_EXERCISES:
     attn_saes = {
         layer: SAE.from_pretrained(
             "gpt2-small-hook-z-kk",
             f"blocks.{layer}.hook_z",
             device=str(device),
         )[0]
-        for layer in [9]  # range(gpt2.cfg.n_layers)  NB - just load one to save memory
+        for layer in range(gpt2.cfg.n_layers)
     }
 
     layer = 9
@@ -678,7 +681,7 @@ def fetch_max_activating_examples_attn(
 
         if dest_idx_in_seq >= 0 and dest_idx_in_seq < len(dest_seq) and source_idx_in_seq >= 0 and source_idx_in_seq < len(source_seq):
             data.append(AttnSeqDFA(
-                act=act,
+                act=act.item(),  # so all_acts can be deallocated after this function runs
                 str_toks_dest=model.to_str_tokens(dest_seq),
                 str_toks_src=model.to_str_tokens(source_seq),
                 dest_pos=dest_idx_in_seq,
@@ -692,12 +695,379 @@ def fetch_max_activating_examples_attn(
 if MAIN and RUN_ATTN_SAE_EXERCISES:
     # Test your function: compare it to dashboard above
     # (max DFA should come from sourcs tokens like " guns", " firearms")
-    gc.collect()
-    t.cuda.empty_cache()
     layer = 9
     sae = attn_saes[layer]
     data = fetch_max_activating_examples_attn(gpt2, attn_saes[layer], gpt2_act_store, latent_idx=2)
     display_top_seqs_attn(data)
+    gc.collect()
+    t.cuda.empty_cache()
 
 
+# %%
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    names = [" John", " Mary"]
+    name_tokens = [gpt2.to_single_token(name) for name in names]
+
+    prompt_template = "When{A} and{B} went to the shops,{S} gave the bag to"
+    prompts = [
+        prompt_template.format(A=names[i], B=names[1 - i], S=names[j])
+        for i, j in itertools.product(range(2), range(2))
+    ]
+    correct_answers = names[::-1] * 2
+    incorrect_answers = names * 2
+    correct_toks = gpt2.to_tokens(correct_answers, prepend_bos=False)[:, 0].tolist()
+    incorrect_toks = gpt2.to_tokens(incorrect_answers, prepend_bos=False)[:, 0].tolist()
+
+
+def logits_to_ave_logit_diff(
+    logits: Float[Tensor, "batch seq d_vocab"],
+    correct_toks: list[int] = correct_toks,
+    incorrect_toks: list[int] = incorrect_toks,
+    reduction: Literal["mean", "sum"] | None = "mean",
+    keep_as_tensor: bool = False,
+) -> list[float] | float:
+    """
+    Returns the avg logit diff on a set of prompts, with fixed s2 pos and stuff.
+    """
+    correct_logits = logits[range(len(logits)), -1, correct_toks]
+    incorrect_logits = logits[range(len(logits)), -1, incorrect_toks]
+    logit_diff = correct_logits - incorrect_logits
+    if reduction is not None:
+        logit_diff = logit_diff.mean() if reduction == "mean" else logit_diff.sum()
+    return logit_diff if keep_as_tensor else logit_diff.tolist()
+
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    # Testing a single prompt (where correct answer is John), verifying model gets it right
+    test_prompt(prompts[1], names, gpt2)
+
+    # Testing logits over all 4 prompts, verifying the model always has a high logit diff
+    logits = gpt2(prompts, return_type="logits")
+    logit_diffs = logits_to_ave_logit_diff(logits, reduction=None)
+    print(
+        tabulate(
+            zip(prompts, correct_answers, logit_diffs),
+            headers=["Prompt", "Answer", "Logit Diff"],
+            tablefmt="simple_outline",
+            numalign="left",
+            floatfmt="+.3f",
+        )
+    )
+
+# %%
+
+
+def check_model_with_sae(
+    model: HookedSAETransformer,
+    saes: list[SAE],
+    prompts: list[str],
+    correct_toks: list[int],
+    incorrect_toks: list[int],
+):
+    clean_logits = model(
+        prompts,
+        return_type="logits"
+    )
+    clean_logit_diff = logits_to_ave_logit_diff(
+        clean_logits,
+        correct_toks,
+        incorrect_toks,
+    )
+    table = Table("Ablation", "Logit diff", "% of clean")
+    table.add_row("Clean", f"{clean_logit_diff:.3f}", "100.0%")
+    for sae in saes:
+        logits = model.run_with_saes(
+            prompts,
+            saes=[sae],
+            return_type="logits",
+        )
+        diff = logits_to_ave_logit_diff(
+            logits,
+            correct_toks,
+            incorrect_toks,
+        )
+        table.add_row(
+            sae.cfg.hook_name,
+            f"{diff:.3f}",
+            f"{diff / clean_logit_diff:.1%}",
+        )
+    rprint(table)
+
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    logit_diffs = check_model_with_sae(
+        gpt2,
+        attn_saes.values(),
+        prompts,
+        correct_toks,
+        incorrect_toks,
+    )
+
+
+# %%
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    sae = attn_saes[9]
+    acts_name = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+    _, cache = gpt2.run_with_cache_with_saes(
+        prompts,
+        saes=[sae],
+        stop_at_layer=sae.cfg.hook_layer + 1,
+        names_filter=[acts_name],
+    )
+    avg_acts = cache[acts_name][:, -1, :].mean(dim=0)
+    px.line(
+        avg_acts.cpu().numpy(),
+        title=f"Latent activations at the final token position ({avg_acts.nonzero().numel()} alive)",
+        labels={"index": "Latent", "value": "Activation"},
+        width=1000,
+    ).update_layout(showlegend=False).show()
+    top_latents = t.topk(avg_acts, 3).indices
+    for latent_idx in top_latents:
+        display_dashboard(
+            sae_release="gpt2-small-hook-z-kk",
+            sae_id="blocks.9.hook_z",
+            latent_idx=latent_idx,
+            width=800,
+            height=600,
+        )
+
+
+# %%
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    sae = attn_saes[9]
+    table = Table("Head", *[f"Avg latent {latent_idx} norm" for latent_idx in top_latents])
+    latent_enc = sae.W_dec[top_latents]
+    decomposed_latent_enc = einops.rearrange(latent_enc, "lat (h dh) -> lat h dh", h = 12)
+    norms = einops.rearrange(decomposed_latent_enc.norm(dim=-1), "lat h -> h lat")
+    for head, h_norms in enumerate(norms / norms.sum(dim=0)):
+        table.add_row(f"{head}", *[f"{h_norms[i]:.2%}" for i in range(3)])
+    rprint(table)
+
+
+# %%
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    sae = attn_saes[9]
+    acts_name = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+    _, cache = gpt2.run_with_cache_with_saes(
+        prompts,
+        saes=[sae],
+        stop_at_layer=sae.cfg.hook_layer + 1,
+        names_filter=[acts_name],
+    )
+    print(cache.keys())
+    acts = einops.rearrange(cache[acts_name][:, -1, :], "b lat -> lat b").unsqueeze(1)
+    weighted_dirs = sae.W_dec.unsqueeze(-1) * acts  # lat dm b
+    weighted_projected_dirs = einops.einsum(
+        weighted_dirs,  # lat dm b
+        einops.rearrange(gpt2.W_O[9], "h dh dm -> (h dh) dm"),  # dm dm,
+        "lat dm1 b, dm1 dm2 -> lat dm2 b"
+    )
+    correct_logits = gpt2.W_U[:, correct_toks]
+    incorrect_logits = gpt2.W_U[:, incorrect_toks]
+    correct_scores = einops.einsum(
+        weighted_projected_dirs,
+        correct_logits,
+        "lat d b, d b -> lat b"
+    )
+    incorrect_scores = einops.einsum(
+        weighted_projected_dirs,
+        incorrect_logits,
+        "lat d b, d b -> lat b"
+    )
+    diffs = (correct_scores - incorrect_scores).mean(dim=-1)
+    px.line(
+        diffs.cpu().numpy(),
+        title=f"Latent logit diffs at the final token position",
+        labels={"index": "Latent", "value": "Diff"},
+        width=1000,
+    ).update_layout(showlegend=False).show()
+    top_latents = t.topk(diffs, 3).indices
+    for latent_idx in top_latents:
+        display_dashboard(
+            sae_release="gpt2-small-hook-z-kk",
+            sae_id="blocks.9.hook_z",
+            latent_idx=latent_idx,
+            width=800,
+            height=600,
+        )
+
+
+# %%
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    layer = 3
+    s2_pos = 10
+    assert gpt2.to_str_tokens(prompts[0])[s2_pos] == " John"
+
+
+def ablate_sae_latent(
+    sae_acts: Tensor,
+    hook: HookPoint,
+    latent_idx: int | None = None,
+    seq_pos: int | None = None,
+) -> Tensor:
+    """
+    Ablate a particular latent at a particular sequence position. If either argument is None, we
+    ablate at all latents / sequence positions respectively.
+    """
+    sae_acts[:, seq_pos, latent_idx] = 0.0
+    return sae_acts
+
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    layer_0_scores = t.zeros((attn_saes[0].cfg.d_sae))
+    layer_3_scores = t.zeros((attn_saes[3].cfg.d_sae))
+
+    for layer in [0, 3]:
+        sae = attn_saes[layer]
+
+        baseline_logits = gpt2.run_with_saes(prompts, saes=[sae], return_type="logits")
+        baseline_diff = (
+            baseline_logits[range(4), -1, correct_toks] - 
+            baseline_logits[range(4), -1, incorrect_toks]
+        )
+
+        acts_name = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+        _, cache = gpt2.run_with_cache_with_saes(
+            prompts,
+            saes=[sae],
+            stop_at_layer=layer + 1,
+            names_filter=[acts_name]
+        )
+        acts = cache[acts_name]  # b ctx dsae
+
+        alive_latents = (acts[:, s2_pos, :] > 0.0).any(dim=0).nonzero().squeeze()
+
+        for i in tqdm(alive_latents, "computing ablation scores..."):
+            gpt2.reset_hooks()
+            logits = gpt2.run_with_hooks_with_saes(
+                prompts,
+                return_type="logits",
+                saes=[sae],
+                fwd_hooks=[
+                    (
+                        acts_name,
+                        partial(ablate_sae_latent, latent_idx=i, seq_pos=s2_pos),
+                    ),
+                ],
+            )
+            diff = logits[range(4), -1, correct_toks] - logits[range(4), -1, incorrect_toks]
+            score = (baseline_diff - diff).mean()
+            if layer == 0:
+                layer_0_scores[i] = score
+            else:
+                layer_3_scores[i] = score
+
+    print(layer_3_scores[alive_latents.cpu()]) 
+    px.line(
+        layer_3_scores.cpu().numpy(),
+        title=f"Latent logit diff changes from ablation",
+        labels={"index": "Latent", "value": "Diff"},
+        width=1000,
+    ).update_layout(showlegend=False).show()
+    top_latents = t.topk(layer_3_scores, 5).indices
+    for latent_idx in top_latents:
+        display_dashboard(
+            sae_release="gpt2-small-hook-z-kk",
+            sae_id="blocks.3.hook_z",
+            latent_idx=latent_idx,
+            width=800,
+            height=600,
+        )
+
+
+# %%
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    ablation_effects = layer_3_scores
+
+def get_cache_fwd_and_bwd(
+    model: HookedSAETransformer, saes: list[SAE], input, metric
+) -> tuple[ActivationCache, ActivationCache]:
+    """
+    Get forward and backward caches for a model, given a metric.
+    """
+    filter_sae_acts = lambda name: "hook_sae_acts_post" in name
+
+    # This hook function will store activations in the appropriate cache
+    cache_dict = {"fwd": {}, "bwd": {}}
+
+    def cache_hook(act, hook, dir: Literal["fwd", "bwd"]):
+        cache_dict[dir][hook.name] = act.detach()
+
+    with model.saes(saes=saes):
+        # We add hooks to cache values from the forward and backward pass respectively
+        with model.hooks(
+            fwd_hooks=[(filter_sae_acts, partial(cache_hook, dir="fwd"))],
+            bwd_hooks=[(filter_sae_acts, partial(cache_hook, dir="bwd"))],
+        ):
+            # Forward pass fills the fwd cache, then backward pass fills the bwd cache (we don't
+            # care about metric value)
+            metric(model(input)).backward()
+
+    return (
+        ActivationCache(cache_dict["fwd"], model),
+        ActivationCache(cache_dict["bwd"], model),
+    )
+
+
+if MAIN and RUN_FIND_LATENTS_EXERCISES:
+    clean_logits = gpt2.run_with_saes(prompts, saes=[attn_saes[layer]])
+    clean_logit_diff = logits_to_ave_logit_diff(clean_logits)
+
+    key = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+    print(key)
+
+    t.set_grad_enabled(True)
+    clean_cache, clean_grad_cache = get_cache_fwd_and_bwd(
+        gpt2,
+        [attn_saes[layer]],
+        prompts,
+        lambda logits: logits_to_ave_logit_diff(logits, keep_as_tensor=True, reduction="sum"),
+    )
+    t.set_grad_enabled(False)
+
+    # YOUR CODE HERE - compute `attribution_values` from the clean activations & clean grad cache
+    attribution_values = (clean_cache[key] * clean_grad_cache[key])[:, s2_pos, :].mean(dim=0)[alive_latents].cpu()
+
+    alive_latents = alive_latents.cpu()
+    # Visualize results
+    px.scatter(
+        pd.DataFrame(
+            {
+                "Ablation": ablation_effects[alive_latents.cpu()].cpu().numpy(),
+                "Attribution Patching": attribution_values.cpu().numpy(),
+                "Latent": alive_latents.cpu(),
+            }
+        ),
+        x="Ablation",
+        y="Attribution Patching",
+        hover_data=["Latent"],
+        title="Attribution Patching vs Ablation",
+        template="ggplot2",
+        width=800,
+        height=600,
+    ).add_shape(
+        type="line",
+        x0=attribution_values.min(),
+        x1=attribution_values.max(),
+        y0=attribution_values.min(),
+        y1=attribution_values.max(),
+        line=dict(color="red", width=2, dash="dash"),
+    ).show()
+
+
+# %%
+
+print(t.cuda.memory_allocated() / 1e9)
+
+# %%
+gc.collect()
+t.cuda.empty_cache()
+
+# %%
+# %%
 # %%
