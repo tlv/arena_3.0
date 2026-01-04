@@ -746,6 +746,7 @@ def create_extended_embedding(model: HookedTransformer) -> Float[Tensor, "d_voca
 if MAIN:
     tests.test_create_extended_embedding(create_extended_embedding, gpt2)
 
+# %%
 
 def show_top_deembeddings_extended(
     model: HookedSAETransformer, sae: SAE, latent_idx: int, k: int = 10
@@ -775,6 +776,51 @@ def show_top_deembeddings_extended(
 if MAIN:
     print(f"Top de-embeddings (extended) for transcoder latent {latent_idx}:")
     show_top_deembeddings_extended(gpt2, gpt2_transcoder, latent_idx=latent_idx)
+
+
+# %%
+
+def show_top_pullbacks(
+    sae: SAE, sae_prev: SAE, latent_idx: int, k: int = 10
+) -> None:
+    """Displays the top pullbacks in sae_prev for a particular latent in sae."""
+    pullbacks = sae_prev.W_dec @ sae.W_enc[:, latent_idx]
+    top_pullbacks, top_latent_ids = pullbacks.topk(k)
+    bottom_pullbacks, bottom_latent_ids = pullbacks.topk(k, largest=False)
+    print(
+        tabulate(
+            zip(
+                map(lambda x: repr(x.item()), bottom_latent_ids),
+                bottom_pullbacks,
+                map(lambda x: repr(x.item()), top_latent_ids),
+                top_pullbacks,
+            ),
+            headers=["Bottom latents", "Value", "Top latents", "Value"],
+            tablefmt="simple_outline",
+            stralign="right",
+            numalign="left",
+            floatfmt="+.3f",
+        )
+    )
+
+# %%
+
+if MAIN:
+    # idx = 355
+    idx = 479
+
+    layer = 8
+    gpt2_transcoder = gpt2_transcoders[layer]
+
+    show_top_deembeddings_extended(
+        gpt2, gpt2_transcoder, latent_idx=idx,
+    )
+    show_top_logits(gpt2, gpt2_transcoder, latent_idx=idx)
+    show_top_pullbacks(
+        gpt2_transcoder, gpt2_transcoders[1], idx
+    )
+    show_top_deembeddings_extended(gpt2, gpt2_transcoders[1], latent_idx=23096)
+    show_top_logits(gpt2, gpt2_transcoders[1], latent_idx=23096)
 
 # %%
 
