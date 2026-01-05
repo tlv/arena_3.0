@@ -110,10 +110,10 @@ if MAIN and RUN_INTRO_EXERCISES:
 
 # %%
 
+gpt2: HookedSAETransformer = HookedSAETransformer.from_pretrained("gpt2-small", device=device)
+
 if MAIN:
     t.set_grad_enabled(False)
-
-    gpt2: HookedSAETransformer = HookedSAETransformer.from_pretrained("gpt2-small", device=device)
 
     gpt2_sae, cfg_dict, sparsity = SAE.from_pretrained(
         release="gpt2-small-res-jb",

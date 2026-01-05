@@ -694,8 +694,9 @@ def show_top_logits(
     )
 
 
-print(f"Top logits for transcoder latent {latent_idx}:")
-show_top_logits(gpt2, gpt2_transcoder, latent_idx=latent_idx)
+if MAIN:
+    print(f"Top logits for transcoder latent {latent_idx}:")
+    show_top_logits(gpt2, gpt2_transcoder, latent_idx=latent_idx)
 
 
 def show_top_deembeddings(
@@ -722,9 +723,10 @@ def show_top_deembeddings(
     )
 
 
-print(f"\nTop de-embeddings for transcoder latent {latent_idx}:")
-show_top_deembeddings(gpt2, gpt2_transcoder, latent_idx=latent_idx)
-tests.test_show_top_deembeddings(show_top_deembeddings, gpt2, gpt2_transcoder)
+if MAIN:
+    print(f"\nTop de-embeddings for transcoder latent {latent_idx}:")
+    show_top_deembeddings(gpt2, gpt2_transcoder, latent_idx=latent_idx)
+    tests.test_show_top_deembeddings(show_top_deembeddings, gpt2, gpt2_transcoder)
 
 # %%
 
@@ -824,12 +826,14 @@ if MAIN:
 
 # %%
 
-print(t.cuda.memory_allocated() / 1e9)
+if MAIN:
+    print(t.cuda.memory_allocated() / 1e9)
 
 # %%
 
-gc.collect()
-t.cuda.empty_cache()
+if MAIN:
+    gc.collect()
+    t.cuda.empty_cache()
 
 
 # %%
